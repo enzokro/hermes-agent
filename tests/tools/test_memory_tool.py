@@ -8,6 +8,7 @@ from tools.memory_tool import (
     MemoryStore,
     memory_tool,
     _scan_memory_content,
+    _word_jaccard,
     ENTRY_DELIMITER,
 )
 
@@ -240,3 +241,52 @@ class TestMemoryToolDispatcher:
     def test_remove_requires_old_text(self, store):
         result = json.loads(memory_tool(action="remove", store=store))
         assert result["success"] is False
+
+
+# =========================================================================
+# Near-duplicate detection
+# =========================================================================
+
+class TestNearDuplicateDetection:
+    """Word Jaccard near-duplicate detection on add."""
+
+    def test_word_jaccard_identical(self):
+        assert _word_jaccard("hello world", "hello world") == 1.0
+
+    def test_word_jaccard_no_overlap(self):
+        assert _word_jaccard("hello world", "foo bar") == 0.0
+
+    def test_word_jaccard_partial(self):
+        sim = _word_jaccard("user prefers dark mode", "user likes dark mode")
+        # 3 shared words (user, dark, mode) out of 5 unique (user, prefers, likes, dark, mode)
+        assert sim == pytest.approx(0.6, abs=0.01)
+
+    def test_word_jaccard_empty(self):
+        assert _word_jaccard("", "hello") == 0.0
+        assert _word_jaccard("", "") == 0.0
+
+    def test_add_flags_similar_entry(self, store):
+        store.add("memory", "User prefers dark mode in all editors")
+        result = store.add("memory", "User likes dark mode in editors")
+        assert result["success"] is True
+        assert "similar_entries" in result
+        assert result["similar_entries"][0]["similarity"] >= 0.50
+
+    def test_add_no_flag_for_different_entry(self, store):
+        store.add("memory", "User prefers dark mode")
+        result = store.add("memory", "Project uses Python 3.12 with FastAPI")
+        assert result["success"] is True
+        assert "similar_entries" not in result
+
+    def test_add_still_succeeds_with_warning(self, store):
+        store.add("memory", "User prefers dark mode in all editors")
+        result = store.add("memory", "User likes dark mode in editors")
+        assert result["success"] is True
+        assert len(store.memory_entries) == 2  # Both entries kept
+
+    def test_similar_entry_preview_truncated(self, store):
+        long_entry = "User prefers " + "very " * 30 + "dark mode"
+        store.add("memory", long_entry)
+        result = store.add("memory", "User prefers very dark mode")
+        if "similar_entries" in result:
+            assert len(result["similar_entries"][0]["entry"]) <= 120

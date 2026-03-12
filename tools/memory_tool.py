@@ -84,6 +84,18 @@ def _scan_memory_content(content: str) -> Optional[str]:
     return None
 
 
+def _word_jaccard(a: str, b: str) -> float:
+    """Word-level Jaccard similarity. Returns 0.0-1.0."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    return len(words_a & words_b) / len(words_a | words_b)
+
+
+NEAR_DUPLICATE_THRESHOLD = 0.50
+
+
 class MemoryStore:
     """
     Bounded curated memory with file persistence. One instance per AIAgent.
@@ -169,6 +181,13 @@ class MemoryStore:
         if content in entries:
             return self._success_response(target, "Entry already exists (no duplicate added).")
 
+        # Near-duplicate detection
+        similar = []
+        for existing in entries:
+            sim = _word_jaccard(content, existing)
+            if sim >= NEAR_DUPLICATE_THRESHOLD:
+                similar.append((sim, existing))
+
         # Calculate what the new total would be
         new_entries = entries + [content]
         new_total = len(ENTRY_DELIMITER.join(new_entries))
@@ -190,7 +209,14 @@ class MemoryStore:
         self._set_entries(target, entries)
         self.save_to_disk(target)
 
-        return self._success_response(target, "Entry added.")
+        resp = self._success_response(target, "Entry added.")
+        if similar:
+            similar.sort(reverse=True)
+            resp["similar_entries"] = [
+                {"similarity": round(s, 2), "entry": e[:120]} for s, e in similar[:3]
+            ]
+            resp["hint"] = "Similar entries found. Consider 'replace' to consolidate."
+        return resp
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
@@ -452,7 +478,8 @@ MEMORY_SCHEMA = {
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n"
         "Capacity shown in system prompt. When >80%, consolidate entries before adding new ones.\n\n"
-        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps."
+        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps.\n"
+        "The tool flags near-duplicate entries on add — consider consolidating instead."
     ),
     "parameters": {
         "type": "object",
