@@ -463,17 +463,36 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         
         # Sort by category then name
         all_skills.sort(key=lambda s: (s.get("category") or "", s["name"]))
-        
+
         # Extract unique categories
         categories = sorted(set(s.get("category") for s in all_skills if s.get("category")))
-        
-        return json.dumps({
+
+        # Annotate with effectiveness metrics if available
+        flagged_skills = []
+        try:
+            from tools.skill_metrics import SkillMetrics
+            metrics = SkillMetrics()
+            metrics.load()
+            for skill in all_skills:
+                m = metrics.get_metrics([skill["name"]]).get(skill["name"])
+                if m and m.get("views", 0) > 0:
+                    skill["times_used"] = m["views"]
+                    skill["effectiveness"] = m.get("label", "untested")
+            flagged_skills = metrics.get_flagged()
+        except Exception:
+            pass  # Metrics are advisory, never block listing
+
+        result = {
             "success": True,
             "skills": all_skills,
             "categories": categories,
             "count": len(all_skills),
-            "hint": "Use skill_view(name) to see full content, tags, and linked files"
-        }, ensure_ascii=False)
+            "hint": "Use skill_view(name) to see full content, tags, and linked files",
+        }
+        if flagged_skills:
+            result["low_effectiveness_skills"] = flagged_skills
+
+        return json.dumps(result, ensure_ascii=False)
         
     except Exception as e:
         return json.dumps({
