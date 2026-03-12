@@ -62,9 +62,14 @@ def _make_agent(monkeypatch, api_mode="chat_completions", provider="openrouter")
         skip_context_files=True,
         skip_memory=True,
     )
-    # Give it a valid memory store
-    agent._memory_store = MagicMock()
+    # Give it a valid memory store with mock success responses
+    mock_store = MagicMock()
+    mock_store._success_response.return_value = {
+        "success": True, "entries": [], "usage": "0% — 0/2,200 chars", "entry_count": 0,
+    }
+    agent._memory_store = mock_store
     agent._memory_flush_min_turns = 1
+    agent._flush_max_rounds = 1  # Default to single-round for existing tests
     agent._user_turn_count = 5
     return agent
 
@@ -76,6 +81,7 @@ def _chat_response_with_memory_call():
             message=SimpleNamespace(
                 content=None,
                 tool_calls=[SimpleNamespace(
+                    id="call_flush_1",
                     function=SimpleNamespace(
                         name="memory",
                         arguments=json.dumps({
@@ -220,3 +226,134 @@ class TestFlushMemoriesCodexFallback:
         mock_stream.assert_called_once()
         mock_memory.assert_called_once()
         assert mock_memory.call_args.kwargs["content"] == "Codex flush test"
+
+
+class TestFlushMemoriesMultiRound:
+    """Multi-round flush: model can sequence remove → add across 2 turns."""
+
+    def test_flush_multi_round_remove_then_add(self, monkeypatch):
+        """First response removes an entry, second response adds a new one."""
+        agent = _make_agent(monkeypatch)
+        agent._flush_max_rounds = 2
+
+        # Round 1: model returns a remove call
+        remove_response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[SimpleNamespace(
+                        id="call_r1",
+                        function=SimpleNamespace(
+                            name="memory",
+                            arguments=json.dumps({
+                                "action": "remove",
+                                "target": "memory",
+                                "old_text": "stale entry",
+                            }),
+                        ),
+                    )],
+                ),
+            )],
+            usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20, total_tokens=120),
+        )
+
+        # Round 2: model returns an add call
+        add_response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[SimpleNamespace(
+                        id="call_r2",
+                        function=SimpleNamespace(
+                            name="memory",
+                            arguments=json.dumps({
+                                "action": "add",
+                                "target": "memory",
+                                "content": "consolidated entry",
+                            }),
+                        ),
+                    )],
+                ),
+            )],
+            usage=SimpleNamespace(prompt_tokens=120, completion_tokens=25, total_tokens=145),
+        )
+
+        call_count = {"n": 0}
+
+        def mock_call_llm(**kwargs):
+            call_count["n"] += 1
+            return remove_response if call_count["n"] == 1 else add_response
+
+        with patch("agent.auxiliary_client.call_llm", side_effect=mock_call_llm):
+            messages = [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"},
+                {"role": "user", "content": "Done"},
+            ]
+            with patch("tools.memory_tool.memory_tool", return_value='{"success": true}') as mock_mem:
+                agent.flush_memories(messages)
+
+        assert call_count["n"] == 2
+        assert mock_mem.call_count == 2
+        # First call was remove, second was add
+        calls = mock_mem.call_args_list
+        assert calls[0].kwargs["action"] == "remove"
+        assert calls[1].kwargs["action"] == "add"
+
+    def test_flush_early_exit_no_tool_calls(self, monkeypatch):
+        """If round 1 produces no tool calls, skip round 2."""
+        agent = _make_agent(monkeypatch)
+        agent._flush_max_rounds = 2
+
+        empty_response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="Nothing to save.", tool_calls=None),
+            )],
+            usage=SimpleNamespace(prompt_tokens=50, completion_tokens=10, total_tokens=60),
+        )
+
+        with patch("agent.auxiliary_client.call_llm", return_value=empty_response) as mock_call:
+            messages = [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"},
+                {"role": "user", "content": "Bye"},
+            ]
+            agent.flush_memories(messages)
+
+        mock_call.assert_called_once()  # Only 1 round, not 2
+
+    def test_flush_sentinel_cleanup_after_multi_round(self, monkeypatch):
+        """Sentinel cleanup works correctly after 2-round flush."""
+        agent = _make_agent(monkeypatch)
+        agent._flush_max_rounds = 2
+
+        # Return tool calls on round 1, none on round 2
+        responses = [
+            _chat_response_with_memory_call(),
+            SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content="Done.", tool_calls=None),
+                )],
+                usage=SimpleNamespace(prompt_tokens=50, completion_tokens=5, total_tokens=55),
+            ),
+        ]
+        call_idx = {"n": 0}
+
+        def mock_call_llm(**kwargs):
+            idx = call_idx["n"]
+            call_idx["n"] += 1
+            return responses[min(idx, len(responses) - 1)]
+
+        with patch("agent.auxiliary_client.call_llm", side_effect=mock_call_llm):
+            messages = [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"},
+                {"role": "user", "content": "Save"},
+            ]
+            original_len = len(messages)
+            with patch("tools.memory_tool.memory_tool", return_value='{"success": true}'):
+                agent.flush_memories(messages)
+
+        assert len(messages) <= original_len
+        for msg in messages:
+            assert "_flush_sentinel" not in msg

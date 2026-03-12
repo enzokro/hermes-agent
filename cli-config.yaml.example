@@ -292,6 +292,11 @@ memory:
   # For exit/reset, only fires if the session had at least this many user turns.
   flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
 
+  # Memory flush rounds: how many API calls the agent gets to consolidate
+  # memories before context compression. More rounds = better consolidation
+  # when memory is near capacity, but costs more. Default: 2 (max: 3)
+  flush_max_rounds: 2
+
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)
 # =============================================================================

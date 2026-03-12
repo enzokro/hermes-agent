@@ -594,6 +594,7 @@ class AIAgent:
         self._user_profile_enabled = False
         self._memory_nudge_interval = 10
         self._memory_flush_min_turns = 6
+        self._flush_max_rounds = 2
         if not skip_memory:
             try:
                 from hermes_cli.config import load_config as _load_mem_config
@@ -602,6 +603,7 @@ class AIAgent:
                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
                 self._memory_flush_min_turns = int(mem_config.get("flush_min_turns", 6))
+                self._flush_max_rounds = int(mem_config.get("flush_max_rounds", 2))
                 if self._memory_enabled or self._user_profile_enabled:
                     from tools.memory_tool import MemoryStore
                     self._memory_store = MemoryStore(
@@ -2569,11 +2571,11 @@ class AIAgent:
         return api_msg
 
     def flush_memories(self, messages: list = None, min_turns: int = None):
-        """Give the model one turn to persist memories before context is lost.
+        """Give the model multiple turns to persist memories before context is lost.
 
         Called before compression, session reset, or CLI exit. Injects a flush
-        message, makes one API call, executes any memory tool calls, then
-        strips all flush artifacts from the message list.
+        message, makes up to flush_max_rounds API calls, executes any memory
+        tool calls, then strips all flush artifacts from the message list.
 
         Args:
             messages: The current conversation messages. If None, uses
@@ -2597,33 +2599,37 @@ class AIAgent:
 
         flush_content = (
             "[System: The session is being compressed. "
-            "Please save anything worth remembering to your memories.]"
+            "Review your current memory entries and save anything worth remembering. "
+            "If memory is near capacity, remove stale or redundant entries first, "
+            "then add new ones. You may use multiple tool calls.]"
         )
         _sentinel = f"__flush_{id(self)}_{time.monotonic()}"
         flush_msg = {"role": "user", "content": flush_content, "_flush_sentinel": _sentinel}
         messages.append(flush_msg)
 
         try:
-            # Build API messages for the flush call
-            _is_strict_api = "api.mistral.ai" in self.base_url.lower()
-            api_messages = []
-            for msg in messages:
-                api_msg = msg.copy()
-                if msg.get("role") == "assistant":
-                    reasoning = msg.get("reasoning")
-                    if reasoning:
-                        api_msg["reasoning_content"] = reasoning
-                api_msg.pop("reasoning", None)
-                api_msg.pop("finish_reason", None)
-                api_msg.pop("_flush_sentinel", None)
-                if _is_strict_api:
-                    self._sanitize_tool_calls_for_strict_api(api_msg)
-                api_messages.append(api_msg)
+            # Truncated context: recent turns + current memory state
+            # The flush model doesn't need the full 80K conversation
+            recent = [m for m in messages if m.get("role") in ("user", "assistant")][-10:]
+            if self._memory_store:
+                mem_state = self._memory_store._success_response("memory")
+                user_state = self._memory_store._success_response("user")
+                state_content = json.dumps({
+                    "current_memory": mem_state,
+                    "current_user_profile": user_state,
+                }, ensure_ascii=False)
+                state_msg = {"role": "user", "content": state_content}
+                api_messages = [state_msg] + recent
+            else:
+                api_messages = list(recent)
+
+            # Add flush message
+            api_messages.append({"role": "user", "content": flush_content})
 
             if self._cached_system_prompt:
                 api_messages = [{"role": "system", "content": self._cached_system_prompt}] + api_messages
 
-            # Make one API call with only the memory tool available
+            # Find the memory tool definition
             memory_tool_def = None
             for t in (self.tools or []):
                 if t.get("function", {}).get("name") == "memory":
@@ -2634,71 +2640,94 @@ class AIAgent:
                 messages.pop()  # remove flush msg
                 return
 
-            # Use auxiliary client for the flush call when available --
-            # it's cheaper and avoids Codex Responses API incompatibility.
-            from agent.auxiliary_client import call_llm as _call_llm
-            _aux_available = True
-            try:
-                response = _call_llm(
-                    task="flush_memories",
-                    messages=api_messages,
-                    tools=[memory_tool_def],
-                    temperature=0.3,
-                    max_tokens=5120,
-                    timeout=30.0,
-                )
-            except RuntimeError:
-                _aux_available = False
-                response = None
+            flush_start = time.monotonic()
+            for flush_round in range(self._flush_max_rounds):
+                if time.monotonic() - flush_start > 30.0:
+                    break
 
-            if not _aux_available and self.api_mode == "codex_responses":
-                # No auxiliary client -- use the Codex Responses path directly
-                codex_kwargs = self._build_api_kwargs(api_messages)
-                codex_kwargs["tools"] = self._responses_tools([memory_tool_def])
-                codex_kwargs["temperature"] = 0.3
-                if "max_output_tokens" in codex_kwargs:
-                    codex_kwargs["max_output_tokens"] = 5120
-                response = self._run_codex_stream(codex_kwargs)
-            elif not _aux_available:
-                api_kwargs = {
-                    "model": self.model,
-                    "messages": api_messages,
-                    "tools": [memory_tool_def],
-                    "temperature": 0.3,
-                    **self._max_tokens_param(5120),
-                }
-                response = self.client.chat.completions.create(**api_kwargs, timeout=30.0)
+                # Use auxiliary client for the flush call when available --
+                # it's cheaper and avoids Codex Responses API incompatibility.
+                from agent.auxiliary_client import call_llm as _call_llm
+                _aux_available = True
+                try:
+                    response = _call_llm(
+                        task="flush_memories",
+                        messages=api_messages,
+                        tools=[memory_tool_def],
+                        temperature=0.3,
+                        max_tokens=5120,
+                        timeout=30.0,
+                    )
+                except RuntimeError:
+                    _aux_available = False
+                    response = None
 
-            # Extract tool calls from the response, handling both API formats
-            tool_calls = []
-            if self.api_mode == "codex_responses" and not _aux_available:
-                assistant_msg, _ = self._normalize_codex_response(response)
-                if assistant_msg and assistant_msg.tool_calls:
-                    tool_calls = assistant_msg.tool_calls
-            elif hasattr(response, "choices") and response.choices:
-                assistant_message = response.choices[0].message
-                if assistant_message.tool_calls:
-                    tool_calls = assistant_message.tool_calls
+                if not _aux_available and self.api_mode == "codex_responses":
+                    # No auxiliary client -- use the Codex Responses path directly
+                    codex_kwargs = self._build_api_kwargs(api_messages)
+                    codex_kwargs["tools"] = self._responses_tools([memory_tool_def])
+                    codex_kwargs["temperature"] = 0.3
+                    if "max_output_tokens" in codex_kwargs:
+                        codex_kwargs["max_output_tokens"] = 5120
+                    response = self._run_codex_stream(codex_kwargs)
+                elif not _aux_available:
+                    api_kwargs = {
+                        "model": self.model,
+                        "messages": api_messages,
+                        "tools": [memory_tool_def],
+                        "temperature": 0.3,
+                        **self._max_tokens_param(5120),
+                    }
+                    response = self.client.chat.completions.create(**api_kwargs, timeout=30.0)
 
-            for tc in tool_calls:
-                if tc.function.name == "memory":
-                    try:
-                        args = json.loads(tc.function.arguments)
-                        flush_target = args.get("target", "memory")
-                        from tools.memory_tool import memory_tool as _memory_tool
-                        result = _memory_tool(
-                            action=args.get("action"),
-                            target=flush_target,
-                            content=args.get("content"),
-                            old_text=args.get("old_text"),
-                            store=self._memory_store,
-                        )
-                        if self._honcho and flush_target == "user" and args.get("action") == "add":
-                            self._honcho_save_user_observation(args.get("content", ""))
-                        if not self.quiet_mode:
-                            print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
-                    except Exception as e:
-                        logger.debug("Memory flush tool call failed: %s", e)
+                # Extract tool calls from the response, handling both API formats
+                tool_calls = []
+                if self.api_mode == "codex_responses" and not _aux_available:
+                    assistant_msg, _ = self._normalize_codex_response(response)
+                    if assistant_msg and assistant_msg.tool_calls:
+                        tool_calls = assistant_msg.tool_calls
+                elif hasattr(response, "choices") and response.choices:
+                    assistant_message = response.choices[0].message
+                    if assistant_message.tool_calls:
+                        tool_calls = assistant_message.tool_calls
+
+                if not tool_calls:
+                    break
+
+                # Track tool call results for multi-round context
+                round_results = []
+
+                for tc in tool_calls:
+                    if tc.function.name == "memory":
+                        try:
+                            args = json.loads(tc.function.arguments)
+                            flush_target = args.get("target", "memory")
+                            from tools.memory_tool import memory_tool as _memory_tool
+                            result = _memory_tool(
+                                action=args.get("action"),
+                                target=flush_target,
+                                content=args.get("content"),
+                                old_text=args.get("old_text"),
+                                store=self._memory_store,
+                            )
+                            round_results.append((tc, result))
+                            if self._honcho and flush_target == "user" and args.get("action") == "add":
+                                self._honcho_save_user_observation(args.get("content", ""))
+                            if not self.quiet_mode:
+                                print(f"  🧠 Memory flush (round {flush_round + 1}): saved to {args.get('target', 'memory')}")
+                        except Exception as e:
+                            round_results.append((tc, json.dumps({"success": False, "error": str(e)})))
+                            logger.debug("Memory flush tool call failed: %s", e)
+
+                # Build assistant + tool result messages for next round
+                assistant_msg = {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc, _ in round_results
+                ]}
+                api_messages.append(assistant_msg)
+                for tc, result_str in round_results:
+                    api_messages.append({"role": "tool", "content": str(result_str), "tool_call_id": tc.id})
         except Exception as e:
             logger.debug("Memory flush API call failed: %s", e)
         finally:
