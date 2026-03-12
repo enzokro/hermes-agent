@@ -23,6 +23,7 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -107,13 +108,14 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, scores=None):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self.scores = scores
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
@@ -208,6 +210,8 @@ class MemoryStore:
         entries.append(content)
         self._set_entries(target, entries)
         self.save_to_disk(target)
+        if self.scores:
+            self.scores.on_add(content)
 
         resp = self._success_response(target, "Entry added.")
         if similar:
@@ -267,9 +271,12 @@ class MemoryStore:
                 ),
             }
 
+        old_entry_text = entries[idx]
         entries[idx] = new_content
         self._set_entries(target, entries)
         self.save_to_disk(target)
+        if self.scores:
+            self.scores.on_entry_change(old_entry_text, new_content)
 
         return self._success_response(target, "Entry replaced.")
 
@@ -298,9 +305,12 @@ class MemoryStore:
             # All identical -- safe to remove just the first
 
         idx = matches[0][0]
+        removed_entry = entries[idx]
         entries.pop(idx)
         self._set_entries(target, entries)
         self.save_to_disk(target)
+        if self.scores:
+            self.scores.on_entry_remove(removed_entry)
 
         return self._success_response(target, "Entry removed.")
 
@@ -334,6 +344,10 @@ class MemoryStore:
         }
         if message:
             resp["message"] = message
+        if self.scores:
+            labels = self.scores.get_labels(entries)
+            if labels:
+                resp["entry_effectiveness"] = labels
         return resp
 
     def _render_block(self, target: str, entries: List[str]) -> str:
@@ -406,6 +420,106 @@ class MemoryStore:
                 raise
         except (OSError, IOError) as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
+
+
+class MemoryScores:
+    """Sidecar effectiveness tracking for memory entries.
+
+    Tracks a per-entry EMA score based on session-level tool success rates.
+    Scores are advisory — shown in tool responses to inform curation decisions.
+    Never injected into the system prompt (preserves prefix cache stability).
+
+    File: MEMORY_DIR / "scores.json"
+    """
+    EMA_ALPHA = 0.1  # Low alpha for noisy binary feedback (MemRL-informed)
+
+    def __init__(self, path: Path = None):
+        self._path = path or MEMORY_DIR / "scores.json"
+        self._data: Dict[str, dict] = {}
+        self._active_hashes: set = set()
+
+    @staticmethod
+    def _hash(entry: str) -> str:
+        return hashlib.md5(entry.strip().encode()).hexdigest()[:8]
+
+    def load(self):
+        if self._path.exists():
+            try:
+                self._data = json.loads(self._path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                self._data = {}
+
+    def save(self):
+        content = json.dumps(self._data, ensure_ascii=False, indent=2)
+        fd, tmp = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
+        try:
+            os.write(fd, content.encode("utf-8"))
+            os.fsync(fd)
+            os.close(fd)
+            os.replace(tmp, str(self._path))
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def snapshot_entries(self, entries: List[str]):
+        """Record which entries are present at session start."""
+        self._active_hashes = {self._hash(e) for e in entries if e.strip()}
+
+    def update_scores(self, tool_success_rate: float):
+        """Update EMA scores for all entries present at session start."""
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        for h in self._active_hashes:
+            entry = self._data.get(h, {"score": 0.5, "sessions": 0})
+            old = entry["score"]
+            entry["score"] = round(old * (1 - self.EMA_ALPHA) + tool_success_rate * self.EMA_ALPHA, 4)
+            entry["sessions"] = entry.get("sessions", 0) + 1
+            entry["last_session"] = now
+            self._data[h] = entry
+
+    def on_add(self, entry: str):
+        """Initialize score for a newly added entry."""
+        h = self._hash(entry)
+        if h not in self._data:
+            self._data[h] = {"score": 0.5, "sessions": 0}
+
+    def on_entry_change(self, old_entry: str, new_entry: str):
+        """Inherit score when an entry is replaced."""
+        old_h, new_h = self._hash(old_entry), self._hash(new_entry)
+        if old_h in self._data and old_h != new_h:
+            self._data[new_h] = self._data.pop(old_h)
+
+    def on_entry_remove(self, entry: str):
+        """Remove score when an entry is deleted."""
+        self._data.pop(self._hash(entry), None)
+
+    def get_labels(self, entries: List[str]) -> Dict[str, str]:
+        """Return {entry_preview: label} for display in tool responses."""
+        labels = {}
+        for e in entries:
+            h = self._hash(e)
+            d = self._data.get(h)
+            if not d:
+                continue
+            score, sessions = d.get("score", 0.5), d.get("sessions", 0)
+            preview = e[:60] + ("..." if len(e) > 60 else "")
+            if sessions < 3:
+                labels[preview] = "untested"
+            elif score >= 0.70 and sessions >= 5:
+                labels[preview] = "proven"
+            elif score >= 0.55:
+                labels[preview] = "solid"
+            elif score <= 0.40 and sessions >= 5:
+                labels[preview] = "weak"
+            else:
+                labels[preview] = "neutral"
+        return labels
 
 
 def memory_tool(

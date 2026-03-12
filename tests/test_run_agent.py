@@ -941,8 +941,13 @@ class TestFlushSentinelNotLeaked:
     def test_flush_sentinel_stripped_from_api_messages(self, agent_with_memory_tool):
         """Verify _flush_sentinel is not sent to the API provider."""
         agent = agent_with_memory_tool
-        agent._memory_store = MagicMock()
+        mock_store = MagicMock()
+        mock_store._success_response.return_value = {
+            "success": True, "entries": [], "usage": "0% — 0/2,200 chars", "entry_count": 0,
+        }
+        agent._memory_store = mock_store
         agent._memory_flush_min_turns = 1
+        agent._flush_max_rounds = 1
         agent._user_turn_count = 10
         agent._cached_system_prompt = "system"
 

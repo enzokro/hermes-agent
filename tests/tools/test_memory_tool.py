@@ -6,6 +6,7 @@ from pathlib import Path
 
 from tools.memory_tool import (
     MemoryStore,
+    MemoryScores,
     memory_tool,
     _scan_memory_content,
     _word_jaccard,
@@ -290,3 +291,99 @@ class TestNearDuplicateDetection:
         result = store.add("memory", "User prefers very dark mode")
         if "similar_entries" in result:
             assert len(result["similar_entries"][0]["entry"]) <= 120
+
+
+# =========================================================================
+# MemoryScores effectiveness tracking
+# =========================================================================
+
+class TestMemoryScores:
+    """MemoryScores sidecar effectiveness tracking."""
+
+    @pytest.fixture()
+    def scores(self, tmp_path):
+        return MemoryScores(path=tmp_path / "scores.json")
+
+    def test_ema_convergence(self, scores):
+        """EMA with alpha=0.1 should converge correctly over sessions."""
+        scores.on_add("test entry")
+        scores.snapshot_entries(["test entry"])
+        # 5 good sessions, then 2 bad, then 3 good
+        for rate in [1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]:
+            scores.update_scores(rate)
+        h = scores._hash("test entry")
+        score = scores._data[h]["score"]
+        assert 0.5 < score < 0.9  # Should trend positive but not extreme
+        assert scores._data[h]["sessions"] == 10
+
+    def test_add_initializes_score(self, scores):
+        scores.on_add("new entry")
+        h = scores._hash("new entry")
+        assert scores._data[h]["score"] == 0.5
+        assert scores._data[h]["sessions"] == 0
+
+    def test_replace_inherits_score(self, scores):
+        scores.on_add("old entry")
+        scores._data[scores._hash("old entry")]["score"] = 0.8
+        scores.on_entry_change("old entry", "new entry")
+        assert scores._hash("old entry") not in scores._data
+        assert scores._data[scores._hash("new entry")]["score"] == 0.8
+
+    def test_remove_deletes_score(self, scores):
+        scores.on_add("temp entry")
+        scores.on_entry_remove("temp entry")
+        assert scores._hash("temp entry") not in scores._data
+
+    def test_labels_proven(self, scores):
+        scores._data[scores._hash("proven entry")] = {"score": 0.75, "sessions": 6}
+        labels = scores.get_labels(["proven entry"])
+        assert list(labels.values())[0] == "proven"
+
+    def test_labels_weak(self, scores):
+        scores._data[scores._hash("weak entry")] = {"score": 0.35, "sessions": 7}
+        labels = scores.get_labels(["weak entry"])
+        assert list(labels.values())[0] == "weak"
+
+    def test_labels_untested(self, scores):
+        scores._data[scores._hash("new entry")] = {"score": 0.50, "sessions": 2}
+        labels = scores.get_labels(["new entry"])
+        assert list(labels.values())[0] == "untested"
+
+    def test_corrupt_json_recovery(self, scores):
+        scores._path.write_text("{invalid json", encoding="utf-8")
+        scores.load()
+        assert scores._data == {}
+
+    def test_missing_file_ok(self, scores):
+        scores.load()
+        assert scores._data == {}
+
+    def test_save_load_roundtrip(self, scores):
+        scores.on_add("test")
+        scores.save()
+        scores2 = MemoryScores(path=scores._path)
+        scores2.load()
+        assert scores2._data == scores._data
+
+    def test_store_integration_add(self, tmp_path, monkeypatch):
+        """MemoryStore.add() calls scores.on_add() when scores provided."""
+        monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
+        sc = MemoryScores(path=tmp_path / "scores.json")
+        store = MemoryStore(scores=sc)
+        store.load_from_disk()
+        store.add("memory", "Test entry for scoring")
+        h = sc._hash("Test entry for scoring")
+        assert h in sc._data
+        assert sc._data[h]["score"] == 0.5
+
+    def test_store_integration_labels_in_response(self, tmp_path, monkeypatch):
+        """_success_response includes entry_effectiveness when scores available."""
+        monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
+        sc = MemoryScores(path=tmp_path / "scores.json")
+        store = MemoryStore(scores=sc)
+        store.load_from_disk()
+        store.add("memory", "Test entry")
+        # Simulate some sessions
+        sc._data[sc._hash("Test entry")] = {"score": 0.75, "sessions": 6}
+        result = store.add("memory", "Another entry")
+        assert "entry_effectiveness" in result

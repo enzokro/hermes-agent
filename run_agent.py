@@ -590,11 +590,15 @@ class AIAgent:
         
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
+        self._memory_scores = None
         self._memory_enabled = False
         self._user_profile_enabled = False
         self._memory_nudge_interval = 10
         self._memory_flush_min_turns = 6
         self._flush_max_rounds = 2
+        self._tool_success_count = 0
+        self._tool_total_count = 0
+        self._skills_viewed_this_session: set = set()
         if not skip_memory:
             try:
                 from hermes_cli.config import load_config as _load_mem_config
@@ -605,12 +609,18 @@ class AIAgent:
                 self._memory_flush_min_turns = int(mem_config.get("flush_min_turns", 6))
                 self._flush_max_rounds = int(mem_config.get("flush_max_rounds", 2))
                 if self._memory_enabled or self._user_profile_enabled:
-                    from tools.memory_tool import MemoryStore
+                    from tools.memory_tool import MemoryStore, MemoryScores
+                    self._memory_scores = MemoryScores()
+                    self._memory_scores.load()
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        scores=self._memory_scores,
                     )
                     self._memory_store.load_from_disk()
+                    self._memory_scores.snapshot_entries(
+                        self._memory_store.memory_entries + self._memory_store.user_entries
+                    )
             except Exception:
                 pass  # Memory is optional -- don't break agent init
         
@@ -662,7 +672,15 @@ class AIAgent:
             self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 15))
         except Exception:
             pass
-        
+
+        self._skill_metrics = None
+        try:
+            from tools.skill_metrics import SkillMetrics
+            self._skill_metrics = SkillMetrics()
+            self._skill_metrics.load()
+        except Exception:
+            pass
+
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section) or environment variables
@@ -2605,11 +2623,10 @@ class AIAgent:
         )
         _sentinel = f"__flush_{id(self)}_{time.monotonic()}"
         flush_msg = {"role": "user", "content": flush_content, "_flush_sentinel": _sentinel}
-        messages.append(flush_msg)
 
         try:
             # Truncated context: recent turns + current memory state
-            # The flush model doesn't need the full 80K conversation
+            # Build BEFORE appending flush_msg to avoid sentinel leaking into api_messages
             recent = [m for m in messages if m.get("role") in ("user", "assistant")][-10:]
             if self._memory_store:
                 mem_state = self._memory_store._success_response("memory")
@@ -2623,8 +2640,11 @@ class AIAgent:
             else:
                 api_messages = list(recent)
 
-            # Add flush message
+            # Add flush message to api_messages (clean, no sentinel)
             api_messages.append({"role": "user", "content": flush_content})
+
+            # Append sentinel-tagged flush message to main messages for cleanup tracking
+            messages.append(flush_msg)
 
             if self._cached_system_prompt:
                 api_messages = [{"role": "system", "content": self._cached_system_prompt}] + api_messages
@@ -2806,6 +2826,19 @@ class AIAgent:
 
         return compressed, new_system_prompt
 
+    def _count_tool_outcome(self, function_result):
+        """Track tool success/failure for effectiveness scoring."""
+        self._tool_total_count += 1
+        if isinstance(function_result, str):
+            try:
+                parsed = json.loads(function_result)
+                if parsed.get("success") is not False:
+                    self._tool_success_count += 1
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                self._tool_success_count += 1
+        else:
+            self._tool_success_count += 1
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages."""
         for i, tool_call in enumerate(assistant_message.tool_calls, 1):
@@ -2841,6 +2874,12 @@ class AIAgent:
                 function_args = {}
             if not isinstance(function_args, dict):
                 function_args = {}
+
+            if function_name == "skill_view":
+                skill_name = function_args.get("name", "")
+                if skill_name and self._skill_metrics:
+                    self._skills_viewed_this_session.add(skill_name)
+                    self._skill_metrics.record_view(skill_name)
 
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
@@ -3025,6 +3064,8 @@ class AIAgent:
                     + f"\n\n[Truncated: tool response was {original_len:,} chars, "
                     f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
                 )
+
+            self._count_tool_outcome(function_result)
 
             tool_msg = {
                 "role": "tool",
@@ -4602,6 +4643,27 @@ class AIAgent:
 
         # Persist session to both JSON log and SQLite
         self._persist_session(messages, conversation_history)
+
+        # Update memory effectiveness scores
+        try:
+            if hasattr(self, '_memory_scores') and self._memory_scores and self._tool_total_count > 0:
+                rate = self._tool_success_count / self._tool_total_count
+                self._memory_scores.update_scores(rate)
+                self._memory_scores.save()
+        except Exception as e:
+            logger.debug("Memory scores update failed: %s", e)
+
+        # Update skill effectiveness
+        try:
+            if (hasattr(self, '_skill_metrics') and self._skill_metrics
+                    and self._skills_viewed_this_session
+                    and self._tool_total_count > 0):
+                rate = self._tool_success_count / self._tool_total_count
+                self._skill_metrics.record_session_outcome(
+                    list(self._skills_viewed_this_session), rate)
+                self._skill_metrics.save()
+        except Exception as e:
+            logger.debug("Skill metrics update failed: %s", e)
 
         # Sync conversation to Honcho for user modeling
         if final_response and not interrupted:
